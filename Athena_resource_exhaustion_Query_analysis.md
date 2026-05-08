@@ -234,7 +234,7 @@ ORDER BY carrier_count DESC;
 
 ```
 InnerJoin[criteria = ("pos" = "pos_start") AND ("ref_0" = "ref") AND ("alt_1" = "alt"), distribution = REPLICATED]
-├─ ScanFilterProject[table = awsdatacatalog$iceberg-aws:catalog:518075716045:s3tablescatalog/eluc-caris-poc-phase-3--s3tables-variants$schema:variants.annotations_dedup]
+├─ ScanFilterProject[table = awsdatacatalog$iceberg-aws:catalog:****:s3tablescatalog/****--s3tables-variants$schema:variants.annotations_dedup]
 └─ LocalExchange[partitioning = HASH, arguments = ["pos_start", "ref", "alt"]]
 ```
 

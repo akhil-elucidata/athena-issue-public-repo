@@ -328,7 +328,7 @@
 <h3>Failing splits — <code>contig = chr6</code> <em>and</em> <code>contig = chr6 + pos[25M–30M]</code></h3>
 <h4>Athena execution plan — chr6 (REPLICATED, wrong)</h4>
 <pre><code class="hljs plaintext">InnerJoin[criteria = ("pos" = "pos_start") AND ("ref_0" = "ref") AND ("alt_1" = "alt"), distribution = REPLICATED]
-├─ ScanFilterProject[table = awsdatacatalog$iceberg-aws:catalog:518075716045:s3tablescatalog/eluc-caris-poc-phase-3--s3tables-variants$schema:variants.annotations_dedup]
+├─ ScanFilterProject[table = awsdatacatalog$iceberg-aws:catalog:****:s3tablescatalog/****--s3tables-variants$schema:variants.annotations_dedup]
 └─ LocalExchange[partitioning = HASH, arguments = ["pos_start", "ref", "alt"]]</code></pre><p>For <strong>both</strong> the <code>chr6 + pos[25M–30M]</code> split <em>and</em> the <code>chr6</code>-only split, Athena produces the <strong>same plan shape</strong>:</p>
 <ul>
 <li>The join is <code>distribution = REPLICATED</code> — i.e., a <strong>broadcast</strong> join (build side replicated to every worker).</li>
