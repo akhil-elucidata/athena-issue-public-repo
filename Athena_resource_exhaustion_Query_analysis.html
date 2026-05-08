@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Markdown Export</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.3.0/github-markdown.min.css">
+  <script>
+      window.MathJax = {
+          tex: {
+              inlineMath: [['$', '$'], ['\\(', '\\)']],
+              displayMath: [['$$', '$$'], ['\\[', '\\]']],
+              processEscapes: true
+          }
+      };
+  </script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js"></script>
+  <style>
+      body {
+          background-color: #ffffff;
+          color: #24292e;
+      }
+      .markdown-body {
+          box-sizing: border-box;
+          min-width: 200px;
+          max-width: 980px;
+          margin: 0 auto;
+          padding: 45px;
+          background-color: #ffffff;
+          color: #24292e;
+      }
+
+      /* Syntax Highlighting */
+      .hljs-doctag, .hljs-keyword, .hljs-template-tag, .hljs-template-variable, .hljs-type, .hljs-variable.language_ { color: #d73a49; }
+      .hljs-title, .hljs-title.class_, .hljs-title.class_.inherited__, .hljs-title.function_ { color: #6f42c1; }
+      .hljs-attr, .hljs-attribute, .hljs-literal, .hljs-meta, .hljs-number, .hljs-operator, .hljs-variable, .hljs-selector-attr, .hljs-selector-class, .hljs-selector-id { color: #005cc5; }
+      .hljs-regexp, .hljs-string, .hljs-meta .hljs-string { color: #032f62; }
+      .hljs-built_in, .hljs-symbol { color: #e36209; }
+      .hljs-comment, .hljs-code, .hljs-formula { color: #6a737d; }
+      .hljs-name, .hljs-quote, .hljs-selector-tag, .hljs-selector-pseudo { color: #22863a; }
+      .hljs-subst { color: #24292e; }
+      .hljs-section { color: #005cc5; font-weight: bold; }
+      .hljs-bullet { color: #005cc5; }
+      .hljs-emphasis { font-style: italic; }
+      .hljs-strong { font-weight: bold; }
+      .hljs-addition { color: #22863a; background-color: #f0fff4; }
+      .hljs-deletion { color: #b31d28; background-color: #ffeef0; }
+
+      .markdown-alert {
+          padding: 0.5rem 1rem;
+          margin-bottom: 16px;
+          border-left: 0.25em solid;
+          border-radius: 0.375rem;
+      }
+      .markdown-alert > :last-child {
+          margin-bottom: 0;
+      }
+      .markdown-alert-title {
+          margin: 0 0 8px;
+          font-weight: 600;
+          line-height: 1.25;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+      }
+      .markdown-alert-icon {
+          display: inline-flex;
+          width: 16px;
+          height: 16px;
+      }
+      .markdown-alert-icon svg {
+          width: 16px;
+          height: 16px;
+          fill: currentColor;
+      }
+      .markdown-alert-note { color: #0969da; border-left-color: #0969da; background-color: #ddf4ff; }
+      .markdown-alert-tip { color: #1a7f37; border-left-color: #1a7f37; background-color: #dafbe1; }
+      .markdown-alert-important { color: #8250df; border-left-color: #8250df; background-color: #fbefff; }
+      .markdown-alert-warning { color: #9a6700; border-left-color: #9a6700; background-color: #fff8c5; }
+      .markdown-alert-caution { color: #cf222e; border-left-color: #cf222e; background-color: #ffebe9; }
+      .markdown-alert > *:not(.markdown-alert-title) { color: #24292e; }
+
+      @media (max-width: 767px) {
+          .markdown-body {
+              padding: 15px;
+          }
+      }
+  </style>
+</head>
+<body>
+  <article class="markdown-body">
+      <h1>Athena Resource Exhaustion — Query Analysis</h1>
+<p>A deep-dive into a workload where Athena throws <strong>"Query resources exhausted at this scale"</strong> on a join between the <code>variants</code> and <code>annotations_dedup</code> Iceberg (S3 Tables) tables — including diagnosis via Athena <code>EXPLAIN ANALYZE</code>, parallel reproduction on a single-node Trino setup on EC2, and an explanation of the underlying CBO mis-estimation that drives the failure.</p>
+<hr>
+<h2>1. Table Details</h2>
+<p>Both tables live in AWS <strong>S3 Tables</strong> (Iceberg, REST catalog). Schemas and partitioning summarized below.</p>
+<h3><code>variants</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Total rows</td>
+<td><strong>~120 B</strong></td>
+</tr>
+<tr>
+<td>Partitioning</td>
+<td><code>contig</code> (identity) + <code>pos_start</code> (truncate 5,000,000) + <code>sample_name</code> (bucket 16)</td>
+</tr>
+<tr>
+<td>Sort order (within partition)</td>
+<td><code>pos_start, ref, alt</code></td>
+</tr>
+<tr>
+<td>Bloom filters</td>
+<td><code>ref</code>, <code>alt</code>, <code>vep_gene</code>, <code>vep_symbol</code></td>
+</tr>
+<tr>
+<td>Target file size</td>
+<td>256 MB</td>
+</tr>
+</tbody></table>
+<p>Key columns used in this analysis: <code>sample_name</code>, <code>contig</code>, <code>pos_start</code>, <code>ref</code>, <code>alt</code>, <code>genotype</code>, <code>read_depth</code>, <code>filters</code>, <code>gnomad_af</code>, <code>pathogenecity</code>, <code>data_source</code>.</p>
+<h3><code>annotations_dedup</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Total rows</td>
+<td><strong>~198 M</strong></td>
+</tr>
+<tr>
+<td>Partitioning</td>
+<td><code>chrom</code> (identity) + <code>pos</code> (truncate 5,000,000)</td>
+</tr>
+<tr>
+<td>Sort order (within partition)</td>
+<td><code>pos, ref, alt</code></td>
+</tr>
+<tr>
+<td>Bloom filters</td>
+<td><code>ref</code>, <code>alt</code>, <code>vep_gene</code>, <code>vep_symbol</code></td>
+</tr>
+<tr>
+<td>Target file size</td>
+<td>128 MB</td>
+</tr>
+</tbody></table>
+<p>Key columns: <code>chrom</code>, <code>pos</code>, <code>ref</code>, <code>alt</code>, <code>symbol</code>, <code>pathogenecity</code>, <code>gnomad_af</code>, <code>impact</code>, <code>consequence</code>.</p>
+<h3>Cardinality reference</h3>
+<ul>
+<li>Distinct <code>(contig, pos/5M)</code> pairs across both tables: <strong>612</strong></li>
+</ul>
+<hr>
+<h2>2. The Query Being Analysed</h2>
+<p>The carrier-count query joins variants × annotations on the canonical <code>(chrom, pos, ref, alt)</code> variant identity, applies a panel of clinical/QC predicates, then aggregates to count distinct carriers per <code>(gene, pathogenicity)</code>.</p>
+<pre><code class="hljs sql"><span class="hljs-keyword">WITH</span> a <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span>
+        symbol,
+        <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">AS</span> pathogenecity,
+        chrom, pos, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> annotations_dedup
+    <span class="hljs-keyword">WHERE</span>
+    <span class="hljs-comment">-- table-specific filters</span>
+        (gnomad_af <span class="hljs-operator">&lt;</span> <span class="hljs-number">0.01</span> <span class="hljs-keyword">OR</span> gnomad_af <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NULL</span>)
+        <span class="hljs-keyword">AND</span> <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%pathogenic%'</span>
+    <span class="hljs-comment">-- AND chrom = 'chr1'</span>
+    <span class="hljs-comment">-- AND chrom = 'chr6' -- and pos between 25000000 AND 29999999</span>
+), v <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span>
+        sample_name,
+        contig, pos_start, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> variants
+    <span class="hljs-keyword">WHERE</span>
+    <span class="hljs-comment">-- table-specific filters</span>
+        genotype <span class="hljs-operator">!=</span> <span class="hljs-string">'0/0'</span>
+        <span class="hljs-keyword">AND</span> read_depth <span class="hljs-operator">&gt;=</span> <span class="hljs-number">10</span>
+        <span class="hljs-keyword">AND</span> filters <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%LowQ%'</span>
+    <span class="hljs-comment">-- AND contig = 'chr1'</span>
+    <span class="hljs-comment">-- AND contig = 'chr6' -- and pos_start between 25000000 AND 29999999</span>
+)
+<span class="hljs-keyword">SELECT</span>
+    a.symbol <span class="hljs-keyword">AS</span> gene,
+    a.pathogenecity,
+    <span class="hljs-built_in">COUNT</span>(<span class="hljs-keyword">DISTINCT</span> v.sample_name) <span class="hljs-keyword">AS</span> carrier_count
+<span class="hljs-keyword">FROM</span> v <span class="hljs-keyword">INNER</span> <span class="hljs-keyword">JOIN</span> a
+    <span class="hljs-keyword">ON</span> v.contig <span class="hljs-operator">=</span> a.chrom
+   <span class="hljs-keyword">AND</span> v.pos_start <span class="hljs-operator">=</span> a.pos
+   <span class="hljs-keyword">AND</span> v.ref      <span class="hljs-operator">=</span> a.ref
+   <span class="hljs-keyword">AND</span> v.alt      <span class="hljs-operator">=</span> a.alt
+<span class="hljs-keyword">GROUP</span> <span class="hljs-keyword">BY</span> a.symbol, a.pathogenecity
+<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> carrier_count <span class="hljs-keyword">DESC</span>;</code></pre><p>We tried <strong>splitting this query into smaller subqueries</strong> (chromosome- and region-scoped) so they could run in parallel against Athena. Most of the splits ran successfully — but a <em>specific</em> split (which was <strong>smaller than several of the splits that did succeed</strong>) consistently failed with <strong>resource exhaustion</strong>. That counter-intuitive result is the reason for this deeper investigation.</p>
+<hr>
+<h2>3. Observations for same query with different filter scopes</h2>
+<p>Same query, four different filter scopes. Smaller scopes are <strong>not</strong> uniformly easier — the chr6 / 25–30 Mb scope is by far the smallest workload by every cardinality measure, yet still exhausts Athena.</p>
+<table>
+<thead>
+<tr>
+<th>Statistic</th>
+<th colspan="4">Filters Applied on the Query (using <code>AND</code>)</th>
+</tr>
+<tr>
+<th></th>
+<th>table-specific filters</th>
+<th>+ <code>contig=chr1</code></th>
+<th>+ <code>contig=chr6</code></th>
+<th>+ <code>contig=chr6</code><br>+ <code>pos=[25M–30M]</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Variants table rows</td>
+<td>119 B</td>
+<td>11 B</td>
+<td>7 B</td>
+<td>428 M</td>
+</tr>
+<tr>
+<td>Annotations table rows</td>
+<td>471 k</td>
+<td>35 k</td>
+<td>20 k</td>
+<td>120</td>
+</tr>
+<tr>
+<td>Distinct <code>(contig, pos/5M)</code> combos in Annotations<br>(used for dynamic filtering / partition pruning in Variants)</td>
+<td>578</td>
+<td>47</td>
+<td>35</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Distinct <code>(contig, pos, ref, alt)</code> combos for joining in Variants</td>
+<td>197 M</td>
+<td>18 M</td>
+<td>9 M</td>
+<td>609 k</td>
+</tr>
+<tr>
+<td>Distinct <code>(contig, pos, ref, alt)</code> for joining in Annotations<br>(= annotation rows)</td>
+<td>471 k</td>
+<td>35 k</td>
+<td>20 k</td>
+<td>120</td>
+</tr>
+<tr>
+<td>No. of rows to be joined (variants × annotations)</td>
+<td>~ 119 B × 471 k</td>
+<td>~ 11 B × 35 k</td>
+<td>~ 7 B × 20 k</td>
+<td>~ 428 M × 120</td>
+</tr>
+<tr>
+<td><b>Query Status (with Athena)</b></td>
+<td>❌ Error<br>(Query resources exhausted)</td>
+<td bgcolor="#D9EAD3">✅ Success<br>Time = 50 s<br>Data scanned = 33 GB<br>Rows = 1,700</td>
+<td>❌ Error<br>(Query resources exhausted)</td>
+<td bgcolor="#F4CCCC">❌ Error<br>(Query resources exhausted)</td>
+</tr>
+<tr>
+<td><b>Query Status (with Trino)</b></td>
+<td>❌ Exceeding memory limit on<br>single-node setup with ~1 TB memory</td>
+<td>—</td>
+<td>—</td>
+<td bgcolor="#D9EAD3">✅ Success<br>Time = 21 s<br>Data scanned = 2 GB<br>Rows = 26</td>
+</tr>
+</tbody>
+</table>
+
+<h3>The counter-intuitive result</h3>
+<ul>
+<li>The <code>chr1</code> split (11 B variant rows × 35 k annotation rows) <strong>succeeds in Athena</strong> in 50 s.</li>
+<li>The <code>chr6 + pos[25M–30M]</code> split (428 M variant rows × <strong>120</strong> annotation rows) — <strong>25× smaller scan, ~290× smaller annotation side, ~30× smaller distinct-key cardinality</strong> — <strong>fails</strong> in Athena with resource exhaustion.</li>
+</ul>
+<p>By every measurable cardinality, the failing split is the smallest workload. That rules out scan size, join cardinality, and group-by skew as primary causes, and forces the investigation onto the <strong>physical plan</strong>.</p>
+<h3>Working vs. failing query</h3>
+<p><strong>Working in Athena (<code>chr1</code> only):</strong></p>
+<pre><code class="hljs sql"><span class="hljs-keyword">WITH</span> a <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span> symbol, <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">AS</span> pathogenecity, chrom, pos, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> annotations_dedup
+    <span class="hljs-keyword">WHERE</span> (gnomad_af <span class="hljs-operator">&lt;</span> <span class="hljs-number">0.01</span> <span class="hljs-keyword">OR</span> gnomad_af <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NULL</span>)
+      <span class="hljs-keyword">AND</span> <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%pathogenic%'</span>
+      <span class="hljs-keyword">AND</span> chrom <span class="hljs-operator">=</span> <span class="hljs-string">'chr1'</span>
+), v <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span> sample_name, contig, pos_start, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> variants
+    <span class="hljs-keyword">WHERE</span> genotype <span class="hljs-operator">!=</span> <span class="hljs-string">'0/0'</span>
+      <span class="hljs-keyword">AND</span> read_depth <span class="hljs-operator">&gt;=</span> <span class="hljs-number">10</span>
+      <span class="hljs-keyword">AND</span> filters <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%LowQ%'</span>
+      <span class="hljs-keyword">AND</span> contig <span class="hljs-operator">=</span> <span class="hljs-string">'chr1'</span>
+)
+<span class="hljs-keyword">SELECT</span> a.symbol <span class="hljs-keyword">AS</span> gene, a.pathogenecity,
+       <span class="hljs-built_in">COUNT</span>(<span class="hljs-keyword">DISTINCT</span> v.sample_name) <span class="hljs-keyword">AS</span> carrier_count
+<span class="hljs-keyword">FROM</span> v <span class="hljs-keyword">INNER</span> <span class="hljs-keyword">JOIN</span> a
+    <span class="hljs-keyword">ON</span> v.contig <span class="hljs-operator">=</span> a.chrom <span class="hljs-keyword">AND</span> v.pos_start <span class="hljs-operator">=</span> a.pos
+   <span class="hljs-keyword">AND</span> v.ref <span class="hljs-operator">=</span> a.ref <span class="hljs-keyword">AND</span> v.alt <span class="hljs-operator">=</span> a.alt
+<span class="hljs-keyword">GROUP</span> <span class="hljs-keyword">BY</span> a.symbol, a.pathogenecity
+<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> carrier_count <span class="hljs-keyword">DESC</span>;</code></pre><p><strong>Throwing Resource Exhaustion in Athena (<code>chr6</code> + <code>pos in [25M, 30M]</code>):</strong></p>
+<pre><code class="hljs sql"><span class="hljs-keyword">WITH</span> a <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span> symbol, <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">AS</span> pathogenecity, chrom, pos, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> annotations_dedup
+    <span class="hljs-keyword">WHERE</span> (gnomad_af <span class="hljs-operator">&lt;</span> <span class="hljs-number">0.01</span> <span class="hljs-keyword">OR</span> gnomad_af <span class="hljs-keyword">IS</span> <span class="hljs-keyword">NULL</span>)
+      <span class="hljs-keyword">AND</span> <span class="hljs-built_in">LOWER</span>(pathogenecity) <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%pathogenic%'</span>
+      <span class="hljs-keyword">AND</span> chrom <span class="hljs-operator">=</span> <span class="hljs-string">'chr6'</span> <span class="hljs-keyword">AND</span> pos <span class="hljs-keyword">BETWEEN</span> <span class="hljs-number">25000000</span> <span class="hljs-keyword">AND</span> <span class="hljs-number">29999999</span>
+), v <span class="hljs-keyword">AS</span> (
+    <span class="hljs-keyword">SELECT</span> sample_name, contig, pos_start, <span class="hljs-keyword">ref</span>, alt
+    <span class="hljs-keyword">FROM</span> variants
+    <span class="hljs-keyword">WHERE</span> genotype <span class="hljs-operator">!=</span> <span class="hljs-string">'0/0'</span>
+      <span class="hljs-keyword">AND</span> read_depth <span class="hljs-operator">&gt;=</span> <span class="hljs-number">10</span>
+      <span class="hljs-keyword">AND</span> filters <span class="hljs-keyword">NOT</span> <span class="hljs-keyword">LIKE</span> <span class="hljs-string">'%LowQ%'</span>
+      <span class="hljs-keyword">AND</span> contig <span class="hljs-operator">=</span> <span class="hljs-string">'chr6'</span> <span class="hljs-keyword">AND</span> pos_start <span class="hljs-keyword">BETWEEN</span> <span class="hljs-number">25000000</span> <span class="hljs-keyword">AND</span> <span class="hljs-number">29999999</span>
+)
+<span class="hljs-keyword">SELECT</span> a.symbol <span class="hljs-keyword">AS</span> gene, a.pathogenecity,
+       <span class="hljs-built_in">COUNT</span>(<span class="hljs-keyword">DISTINCT</span> v.sample_name) <span class="hljs-keyword">AS</span> carrier_count
+<span class="hljs-keyword">FROM</span> v <span class="hljs-keyword">INNER</span> <span class="hljs-keyword">JOIN</span> a
+    <span class="hljs-keyword">ON</span> v.contig <span class="hljs-operator">=</span> a.chrom <span class="hljs-keyword">AND</span> v.pos_start <span class="hljs-operator">=</span> a.pos
+   <span class="hljs-keyword">AND</span> v.ref <span class="hljs-operator">=</span> a.ref <span class="hljs-keyword">AND</span> v.alt <span class="hljs-operator">=</span> a.alt
+<span class="hljs-keyword">GROUP</span> <span class="hljs-keyword">BY</span> a.symbol, a.pathogenecity
+<span class="hljs-keyword">ORDER</span> <span class="hljs-keyword">BY</span> carrier_count <span class="hljs-keyword">DESC</span>;</code></pre><hr>
+<h2>4. Athena <code>EXPLAIN ANALYZE</code> — The Plan Mistake</h2>
+<h3>Failing splits — <code>contig = chr6</code> <em>and</em> <code>contig = chr6 + pos[25M–30M]</code></h3>
+<h4>Athena execution plan — chr6 (REPLICATED, wrong)</h4>
+<pre><code class="hljs plaintext">InnerJoin[criteria = ("pos" = "pos_start") AND ("ref_0" = "ref") AND ("alt_1" = "alt"), distribution = REPLICATED]
+├─ ScanFilterProject[table = awsdatacatalog$iceberg-aws:catalog:518075716045:s3tablescatalog/eluc-caris-poc-phase-3--s3tables-variants$schema:variants.annotations_dedup]
+└─ LocalExchange[partitioning = HASH, arguments = ["pos_start", "ref", "alt"]]</code></pre><p>For <strong>both</strong> the <code>chr6 + pos[25M–30M]</code> split <em>and</em> the <code>chr6</code>-only split, Athena produces the <strong>same plan shape</strong>:</p>
+<ul>
+<li>The join is <code>distribution = REPLICATED</code> — i.e., a <strong>broadcast</strong> join (build side replicated to every worker).</li>
+<li><strong>The <code>annotations_dedup</code> table is on the probe (scan) side, with <code>dynamicFilters</code> applied</strong> to it. Dynamic filters always flow build → probe, which means…</li>
+<li><strong>The <code>variants</code> table is the build side and is being broadcast.</strong></li>
+</ul>
+<p>This is the opposite of what we want: variants is the <em>huge</em> table (428 M rows post-filter for the 5 Mb region, ~16 GB compressed), and annotations is the <em>tiny</em> table (120 rows / a few KB). Broadcasting variants forces every Athena worker to build a hash table over the variants slice — Athena workers have limited (and <strong>non-customisable</strong>) per-node memory, so this OOMs and the query fails.</p>
+<p>Crucially: <strong>the chr6-only split fails the same way</strong> as chr6+pos, even though it's a much larger workload. The failure mode is plan-shape, not data-volume.</p>
+<h3>Succeeding split — <code>contig = chr1</code></h3>
+<h4>Athena execution plan — chr1 (PARTITIONED)</h4>
+<pre><code class="hljs plaintext">InnerJoin[criteria = ("pos_start" = "pos") AND ("ref" = "ref_0") AND ("alt" = "alt_1"), distribution = PARTITIONED]</code></pre><p>For the <code>chr1</code> split, Athena chose a <strong>completely different plan</strong>:</p>
+<ul>
+<li>The join is <code>distribution = PARTITIONED</code> — i.e., a <strong>hash-partitioned shuffle join</strong>, <em>not</em> a broadcast.</li>
+<li>Both inputs are repartitioned by the hash of the join key <code>(contig, pos, ref, alt)</code> and joined locally on each worker.</li>
+<li>Neither table is broadcast. There is no per-node hash-table-over-the-whole-build-side requirement, so per-node memory is bounded by the partitioned slice on each worker, not by the full filtered table.</li>
+</ul>
+<p>That's why the <code>chr1</code> split succeeds despite having <strong>25× more variant rows</strong> than the failing chr6+pos split: the plan distributes both sides instead of putting the whole large side into every worker's memory.</p>
+<h3>What this isolates</h3>
+<table>
+<thead>
+<tr>
+<th>Split</th>
+<th>Athena plan</th>
+<th>Outcome</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>contig = chr1</code></td>
+<td><code>distribution = PARTITIONED</code> (hash shuffle, no broadcast)</td>
+<td>✅ Success (50 s)</td>
+</tr>
+<tr>
+<td><code>contig = chr6</code></td>
+<td><code>distribution = REPLICATED</code>, variants broadcast (annotations on probe)</td>
+<td>❌ Resource exhausted</td>
+</tr>
+<tr>
+<td><code>contig = chr6 + pos[25M–30M]</code></td>
+<td><code>distribution = REPLICATED</code>, variants broadcast (annotations on probe)</td>
+<td>❌ Resource exhausted</td>
+</tr>
+</tbody></table>
+<p>So: <strong>the failing queries aren't failing because of data volume; they're failing because Athena picks <code>REPLICATED</code> with the wrong build side, while for chr1 it instead picks <code>PARTITIONED</code> and avoids the broadcast altogether.</strong></p>
+<hr>
+<h2>5. Reproducing &amp; Diagnosing on Trino</h2>
+<p>To get more visibility into the plan and to test workarounds with <code>EXPLAIN ANALYZE</code> and session properties, we set up:</p>
+<blockquote>
+<p><strong>Single-node Trino on EC2, 1 TB memory, 192 vCPUs</strong>, pointed at the same S3 Tables Iceberg catalog.</p>
+</blockquote>
+<p>Trino made the <strong>same wrong plan choice</strong> as Athena, but the larger memory available let it complete the chr6 / 25–30 Mb query (≈25 s, peak memory 24.4 GB on the join). On Athena workers — which have a fixed, non-customisable per-node memory budget (confirmed by AWS support) — the same plan exhausts resources and aborts.</p>
+<p>This neatly isolates the cause: <strong>same plan on both engines, but only the larger-memory engine survives it.</strong></p>
+<h3>How <code>SET SESSION join_distribution_type = 'BROADCAST'</code> changes the Trino plan</h3>
+<h4>Trino plan <strong>without</strong> explicit <code>join_distribution_type = BROADCAST</code> (i.e., <code>AUTOMATIC</code> — default)</h4>
+<pre><code class="hljs plaintext">InnerJoin[criteria = (pos = pos_start) AND (ref_0 = ref) AND (alt_1 = alt),
+         distribution = REPLICATED]
+├─ ScanFilterProject[table = iceberg:variants.annotations_dedup]
+└─ LocalExchange[partitioning = HASH, arguments = [pos_start::integer, ref::varchar, alt::varchar]]</code></pre><ul>
+<li><strong><code>annotations_dedup</code> is at the scan/probe end (left).</strong></li>
+<li><strong><code>variants</code> is broadcast</strong> from the remote fragment (right / build).</li>
+<li>❌ <strong>Wrong</strong> — large table being broadcast.</li>
+</ul>
+<h4>Trino plan <strong>with</strong> explicit <code>join_distribution_type = BROADCAST</code></h4>
+<pre><code class="hljs plaintext">InnerJoin[criteria = (contig = chrom) AND (pos_start = pos) AND (ref = ref_0) AND (alt = alt_1),
+         distribution = REPLICATED]
+├─ ScanFilterProject[table = iceberg:variants.variants]
+└─ LocalExchange[partitioning = HASH, arguments = [chrom::varchar, pos::integer, ref_0::varchar, alt_1::varchar]]</code></pre><ul>
+<li><strong><code>variants</code> is at the scan/probe end (left).</strong></li>
+<li><strong><code>annotations_dedup</code> is broadcast</strong> from the remote fragment (right / build).</li>
+<li>✅ <strong>Correct</strong> — small table being broadcast.</li>
+</ul>
+<h3>How to read which side is broadcast in a Trino plan</h3>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>What it tells you</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>InnerJoin[..., distribution = REPLICATED]</code></td>
+<td>This is a broadcast join (vs <code>PARTITIONED</code>).</td>
+</tr>
+<tr>
+<td>Right child of a <code>REPLICATED</code> join</td>
+<td>The <strong>build / broadcast</strong> side.</td>
+</tr>
+<tr>
+<td>A fragment with <code>Output partitioning: BROADCAST []</code></td>
+<td>That fragment's output is the broadcast input — whatever scan it contains is the build side.</td>
+</tr>
+<tr>
+<td><code>ScanFilterProject ... dynamicFilters = {...}</code></td>
+<td>That scan is the <strong>probe</strong> side (DFs are <em>collected from</em> the build and <em>applied to</em> the probe).</td>
+</tr>
+</tbody></table>
+<p>For a <code>PARTITIONED</code> (shuffle) join, both inputs come in via separate fragments with <code>Output partitioning: HASH [join_keys]</code> — neither side is broadcast.</p>
+<hr>
+<h2>6. What <code>join_distribution_type = BROADCAST</code> Actually Does</h2>
+<p>Verbatim from the <a href="https://trino.io/docs/current/admin/properties-general.html#join-distribution-type">Trino documentation</a>:</p>
+<blockquote>
+<p><strong><code>join-distribution-type</code></strong></p>
+<ul>
+<li><strong>Type:</strong> <code>string</code></li>
+<li><strong>Allowed values:</strong> <code>AUTOMATIC</code>, <code>PARTITIONED</code>, <code>BROADCAST</code></li>
+<li><strong>Default value:</strong> <code>AUTOMATIC</code></li>
+<li><strong>Session property:</strong> <code>join_distribution_type</code></li>
+</ul>
+<p>The type of distributed join to use. When set to <code>PARTITIONED</code>, Trino uses hash distributed joins. When set to <code>BROADCAST</code>, it broadcasts the right table to all nodes in the cluster that have data from the left table. Partitioned joins require redistributing both tables using a hash of the join key. This can be slower, sometimes substantially, than broadcast joins, but allows much larger joins. In particular broadcast joins are faster, if the right table is much smaller than the left. However, broadcast joins require that the tables on the right side of the join after filtering fit in memory on each node, whereas distributed joins only need to fit in distributed memory across all nodes.</p>
+<blockquote>
+<p><strong>⭐ When set to <code>AUTOMATIC</code>, Trino makes a cost based decision as to which distribution type is optimal. <em>It considers switching the left and right inputs to the join.</em> In <code>AUTOMATIC</code> mode, Trino defaults to hash distributed joins if no cost could be computed, such as if the tables do not have statistics.</strong></p>
+</blockquote>
+</blockquote>
+<p>The highlighted sentence is the crux of this whole investigation.</p>
+<hr>
+<h2>7. Why <code>BROADCAST</code> Fixes a Plan That <code>AUTOMATIC</code> Gets Wrong</h2>
+<p>When <code>join_distribution_type = AUTOMATIC</code>, Trino's CBO doesn't just choose the <em>distribution</em> — it also evaluates <strong>swapping the join inputs</strong> as part of the same cost comparison. With our broken row estimates:</p>
+<pre><code class="hljs plaintext">variants    estimated post-filter:    865 rows  ← what the CBO believes
+variants    actual    post-filter: 428,553,226 rows
+annotations estimated post-filter: 82,164 rows
+annotations actual    post-filter:    129 rows</code></pre><p>The CBO concludes "variants is 95× smaller, so swap inputs and broadcast variants." It rewrites the plan to put variants on the right (build) and annotations on the left (probe). Wrong, but — given those estimates — internally consistent.</p>
+<p>When <code>join_distribution_type = BROADCAST</code> is forced, the rule simplifies. Distribution is settled, and the input-swap decision falls back on a much simpler heuristic that effectively <strong>preserves the SQL order</strong>. Our query reads <code>FROM v INNER JOIN a</code>, so <code>a</code> (annotations) is the right operand — the natural build side in SQL semantics — and that order survives. Annotations stays on the right, becomes the build, gets broadcast.</p>
+<p>So forcing <code>BROADCAST</code> isn't really <em>making the optimizer smarter about distribution</em>. It's <strong>disabling the cost-based input swap that the bad statistics were misleading.</strong></p>
+<hr>
+<h2>8. The Athena vs Trino Asymmetry</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Athena</th>
+<th>Trino (1 TB EC2, 192 vCPUs)</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Plan choice (chr6 / 25–30 Mb, default settings)</td>
+<td>Variants broadcast (wrong)</td>
+<td>Variants broadcast (wrong)</td>
+</tr>
+<tr>
+<td>Per-node memory</td>
+<td>Fixed, <strong>non-customisable</strong> (confirmed by AWS support)</td>
+<td>Fully customisable</td>
+</tr>
+<tr>
+<td>Outcome</td>
+<td>❌ Resource exhaustion</td>
+<td>✅ Completes (~25 s, 24.4 GB peak)</td>
+</tr>
+<tr>
+<td>Session knobs (<code>join_distribution_type</code>, etc.)</td>
+<td>❌ Not user-exposed</td>
+<td>✅ Available</td>
+</tr>
+<tr>
+<td>Hint syntax (<code>/*+ BROADCAST */</code>)</td>
+<td>❌ Not supported</td>
+<td>❌ Not supported (Trino doesn't support hints either)</td>
+</tr>
+</tbody></table>
+<p><strong>Same wrong plan on both — Trino has the headroom to absorb the mistake; Athena does not.</strong></p>
+<hr>
+<h2>9. CBO Statistics on S3 Tables — A Hard Wall</h2>
+<p>Iceberg supports two layers of statistics:</p>
+<ol>
+<li><strong>Manifest-derived stats</strong> — min/max bounds, null counts, value counts. Written automatically on every data write. Drives partition pruning, range-predicate selectivity, etc.</li>
+<li><strong>Puffin sidecar files</strong> — extended stats including NDVs (Theta sketches). <strong>Written only by <code>ANALYZE</code>.</strong> Drives selectivity for equality, <code>IN</code>, <code>&lt;&gt;</code>, <code>LIKE</code>, etc.</li>
+</ol>
+<p>In our environment:</p>
+<pre><code class="hljs plaintext">S3 Tables do not support analyze   -- error returned by Trino</code></pre><p>Both <code>ANALYZE</code> and <code>SHOW STATS FOR &lt;table&gt;</code> are rejected by the AWS-managed S3 Tables REST catalog. The metadata-extension surface is locked down. The optimizer is therefore <em>permanently</em> limited to manifest stats (no NDVs), and any selectivity mis-estimates that arise from missing NDV stats <strong>cannot</strong> be fixed by feeding the optimizer better statistics.</p>
+<blockquote>
+<p><strong>Consequence:</strong> at this scale, manual customisation and optimisation cannot be fully avoided, and that comes with at least some level of ongoing maintenance.</p>
+</blockquote>
+<hr>
+<h2>10. Whole-Genome Plan — Timing Analysis (Trino, with <code>BROADCAST</code> forced)</h2>
+<p>For the whole-genome version of the query (no chrom/pos filter), Trino with <code>join_distribution_type=BROADCAST</code> runs the plan in the right shape and completes in <strong>4.11 minutes wall clock</strong>.</p>
+<h3>Wall clock vs CPU</h3>
+<pre><code class="hljs plaintext">Wall clock:        4.11 min  (Execution)
+Total CPU:        ~10.5 hours  (Fragment 5 alone: 10.36 h)
+Total scheduled:  ~1.02 days   (Fragment 5 alone)</code></pre><p>CPU/wall ≈ <strong>150× parallelism</strong> — the cluster is being used effectively. Wall clock isn't a parallelism problem.</p>
+<h3>Time per fragment</h3>
+<table>
+<thead>
+<tr>
+<th>Fragment</th>
+<th>CPU</th>
+<th>Scheduled</th>
+<th>Blocked</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>6 (annotations scan)</td>
+<td>15.40 s</td>
+<td>1.09 m</td>
+<td>0</td>
+<td>trivial, broadcast</td>
+</tr>
+<tr>
+<td><strong>5 (variants scan + join)</strong></td>
+<td><strong>10.36 h</strong></td>
+<td><strong>1.02 d</strong></td>
+<td>2.42 h</td>
+<td><strong>the cost center</strong></td>
+</tr>
+<tr>
+<td>4 (final aggregate)</td>
+<td>8.08 m</td>
+<td>9.98 m</td>
+<td>1.83 h</td>
+<td>38 GB peak memory</td>
+</tr>
+<tr>
+<td>3 (partial → final agg)</td>
+<td>220 ms</td>
+<td>240 ms</td>
+<td>4.38 h</td>
+<td>mostly waiting</td>
+</tr>
+<tr>
+<td>2 (sort)</td>
+<td>89 ms</td>
+<td>90 ms</td>
+<td>2.26 h</td>
+<td>mostly waiting</td>
+</tr>
+<tr>
+<td>1 (output)</td>
+<td>2 ms</td>
+<td>2 ms</td>
+<td>4.11 m</td>
+<td>output streaming</td>
+</tr>
+</tbody></table>
+<p>Upstream "Blocked" hours are the downstream fragments waiting on fragment 5 — confirmation that the bottleneck is the variants scan.</p>
+<h3>Inside Fragment 5 — the 4-minute wall clock</h3>
+<pre><code class="hljs plaintext">Physical input time:    2.57 h    ← aggregate across all tasks reading 365.79 GB
+ScanFilterProject CPU:  6.33 h    ← filter eval on 120 B rows
+InnerJoin CPU:          3.83 h    ← probe 119 B rows against ~471 k build
+PARTIAL aggregate CPU:  11.23 m   ← collapsing 1.45 B join output → 491 M rows
+Total fragment CPU:    10.36 h</code></pre><p><strong>Two-thirds of CPU is scan + predicate evaluation on variants.</strong> The join itself is only 37% of CPU, and the partial aggregate is 1.8%. The bottleneck is reading and filtering 12.71 TB of variants — not the join, not the aggregate.</p>
+<h3>What the timings rule out</h3>
+<ul>
+<li><strong>Not network/shuffle bound.</strong> Fragment 4 receives 28.56 GB across the cluster with CPU 8 m vs scheduled 10 m — almost no waiting.</li>
+<li><strong>Not aggregate-bound.</strong> 491 M intermediate rows at 38 GB peak completes in 8 m CPU. Trivial next to the scan.</li>
+<li><strong>Not metadata-bound.</strong> Splits generation: 957 ms for 22,068 splits.</li>
+<li><strong>Not DF-collection bound.</strong> DFs collected in 471 ms — instant.</li>
+</ul>
+<blockquote>
+<p><strong>Verdict:</strong> scan-bound, parallelism-saturated, plan is fine. To go faster, materialize.</p>
+</blockquote>
+<hr>
+<h2>11. Whole-Genome Plan — Row Count Analysis</h2>
+<p>Tracing row counts top-to-bottom shows where data actually compresses (and where it doesn't).</p>
+<h3>Fragment 5 — input through join output</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Rows</th>
+<th>Bytes</th>
+<th>Reduction vs prior</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>variants raw read</td>
+<td>120,089,370,515</td>
+<td>12.71 TB</td>
+<td>—</td>
+</tr>
+<tr>
+<td>after <code>genotype</code> / <code>read_depth</code> / <code>filters</code> predicates</td>
+<td>119,076,006,119</td>
+<td>9.82 TB</td>
+<td><strong>0.84% filtered</strong></td>
+</tr>
+<tr>
+<td>after dynamic filter join on <code>(contig, pos, ref, alt)</code></td>
+<td>(same as above)</td>
+<td>(same)</td>
+<td>DF was inert</td>
+</tr>
+<tr>
+<td><strong>InnerJoin output</strong></td>
+<td>1,455,279,868</td>
+<td>86.03 GB</td>
+<td>82× from 119 B</td>
+</tr>
+<tr>
+<td>PARTIAL aggregate by <code>(symbol, expr, sample_name)</code></td>
+<td>491,790,436</td>
+<td>28.56 GB</td>
+<td>3× from 1.45 B</td>
+</tr>
+</tbody></table>
+<p><strong>Things that jump out:</strong></p>
+<ul>
+<li><strong>The predicate filter is barely doing anything.</strong> 119/120 B rows survive. The CBO estimated 120 B → 1.28 M (off by <strong>~93,000×</strong>). Reality: 0.84% filtered.</li>
+<li><strong>DF collection happened (471 ms), but the DF ranges were genome-wide:</strong><pre><code class="hljs plaintext">df_792 (contig):  [chr1, chrY]                ← spans entire genome
+df_793 (pos):     [45695, 247921109]          ← spans 250 Mb
+df_794 (ref/alt): [-, TTTTTTT...]             ← effectively unbounded</code></pre>Because annotations after filter span the whole genome, the broadcast-side min/max ranges are too wide to prune anything. <strong>DFs only help when the build side is narrow on the join keys.</strong> With a <code>chrom</code> or <code>pos</code> filter on annotations, DFs become powerful (in the chr1 plan, DF had 31,998 ranges and pruned aggressively); without one, they're inert. So the 12.71 TB of physical I/O really did get touched.</li>
+<li><strong>The join is the real reducer:</strong> 119 B → 1.45 B (82× reduction). That's the inner-join filtering on <code>(contig, pos, ref, alt)</code> against the 471 k annotation keys. Variants whose join key isn't in annotations get dropped. This is the actual selectivity that the CBO should have predicted <em>via the join</em> but couldn't predict via the predicates alone.</li>
+</ul>
+<h3>Fragment 6 — annotations build side</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Rows</th>
+<th>Bytes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>annotations raw read</td>
+<td>197,816,827</td>
+<td>10.61 GB</td>
+</tr>
+<tr>
+<td>after <code>gnomad_af</code> and <code>LIKE '%pathogenic%'</code></td>
+<td>471,246</td>
+<td>42.96 MB</td>
+</tr>
+</tbody></table>
+<p><strong>99.76% filtered</strong> — a 250× reduction. The CBO estimated 38 M post-filter (off by 80×) but the real answer is small enough that broadcasting is trivial regardless.</p>
+<h3>Fragment 4 — cross-cluster aggregate</h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Rows</th>
+<th>Bytes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>input (after HASH redistribute on <code>symbol/expr</code>)</td>
+<td>491,790,436</td>
+<td>28.56 GB</td>
+</tr>
+<tr>
+<td>FINAL distinct on <code>(symbol, expr, sample_name)</code></td>
+<td>487,662,321</td>
+<td>28.32 GB</td>
+</tr>
+<tr>
+<td>PARTIAL count by <code>(symbol, expr)</code></td>
+<td>587,936</td>
+<td>27.44 MB</td>
+</tr>
+</tbody></table>
+<p>The first step (<code>Aggregate FINAL keys = [symbol, expr, sample_name]</code>) only deduplicates 0.84% — meaning the 491 M rows arrived almost-unique because the partial agg in fragment 5 happened pre-shuffle on the same key. Across-worker duplicates are rare.</p>
+<p>The huge collapse — <strong>491 M → 588 k</strong>, 836× — happens at the next step where <code>count(DISTINCT sample_name)</code> becomes <code>count(*)</code> per <code>(symbol, expr)</code> group. That's the real funnel.</p>
+<h3>Fragments 3 → 2 → 1</h3>
+<table>
+<thead>
+<tr>
+<th>Fragment</th>
+<th>Rows</th>
+<th>Bytes</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>3 (FINAL count by <code>symbol/expr</code>)</td>
+<td>587,936 → 18,373</td>
+<td>27.44 MB → 878 kB</td>
+</tr>
+<tr>
+<td>2 (sort)</td>
+<td>18,373</td>
+<td>878 kB</td>
+</tr>
+<tr>
+<td>1 (output)</td>
+<td>18,373</td>
+<td>878 kB</td>
+</tr>
+</tbody></table>
+<p>The 587,936 → 18,373 collapse in fragment 3 is a <strong>32× reduction</strong> during FINAL aggregate — each <code>(symbol, expr)</code> group had ~32 partial entries, consistent with the cluster's ~150× parallelism budget split across the aggregate.</p>
+<h3>Cardinality summary</h3>
+<pre><code class="hljs plaintext">120,089,370,515   variants raw input
+119,076,006,119   after predicates              (0.84% reduction)
+  1,455,279,868   after join (inner on 471 k)   (82× reduction)
+    491,790,436   after partial dedup           (3× reduction)
+    487,662,321   after global dedup            (1× — almost no dups)
+        587,936   after partial count agg       (836× reduction)
+         18,373   after final count agg         (32× reduction)
+         18,373   final output rows</code></pre><h3>What the row counts argue</h3>
+<ul>
+<li><strong>The predicate filter is dead weight.</strong> It's not selective and the CBO doesn't know that — its post-filter row estimate is ~93,000× too low. Predicate rewriting (replacing <code>&lt;&gt;</code>/wildcard <code>LIKE</code>/function-wrapped column forms with shapes the CBO can estimate, like explicit <code>IN (...)</code> lists) is worth trying as a way to nudge the row estimates closer to reality, but it isn't a guaranteed fix and won't change wall clock — the workload is still scan-bound either way.</li>
+<li><strong>The join is doing the real filtering.</strong> 471 k annotation keys filter 119 B variants → 1.45 B. The most useful materialization candidate is the <em>filtered annotation key set</em> (<code>SELECT DISTINCT chrom, pos, ref, alt FROM annotations_dedup WHERE … pathogenic …</code>) — already 471 k rows / 43 MB.</li>
+<li><strong>Sample distinct-set is the second reducer.</strong> 1.45 B join rows have 487 M distinct <code>(symbol, pathogenicity, sample_name)</code> triples — each variant carrier produces ~3 rows on average; dedup buys ~3×. The big collapse comes at the per-gene count step (836×).</li>
+<li><strong>Final answer is 18 k rows.</strong> The whole pipeline exists to compress 120 B → 18 k. The compression is dominated by the join (82×) and the count (836×). Everything else is plumbing.</li>
+</ul>
+<hr>
+<h2>12. Memory Pressure — Where the Real Watermark Is</h2>
+<blockquote>
+<p>Memory pressure in this workload is in the <strong>final aggregate, not the join</strong>.</p>
+<p>Peak: fragment 4 = <strong>38.01 GB</strong>, fragment 5 = 10.38 GB.</p>
+<p>The 38 GB is the FINAL aggregate hashing <code>(symbol, expr, sample_name)</code> over <strong>487 M intermediate rows</strong>. <strong>This is the real watermark for sizing the cluster.</strong></p>
+</blockquote>
+<p>Athena workers have a fixed per-node memory budget that cannot accommodate this aggregate at whole-genome scope. Trino on a 1 TB box can.</p>
+<hr>
+<h2>13. Workarounds Available, by Engine</h2>
+<h3>Trino (local, EC2)</h3>
+<p>In priority order:</p>
+<ol>
+<li><strong><code>SET SESSION join_distribution_type = 'BROADCAST'</code></strong> — what we're using; works but is a blunt instrument (forces broadcast for every join in the session &amp; but also preserves the SQL order for the join, for deciding which table to use at probe end (left) &amp; which to use at build/broadcast end (right)).</li>
+<li><strong><code>SET SESSION join_max_broadcast_table_size = '50MB'</code></strong> while keeping <code>AUTOMATIC</code> distribution. Caps which sides are eligible for broadcasting. Annotations (~43 MB post-filter) stays eligible; variants (16 GB) doesn't. Even with bad stats, the optimizer can't pick variants as build because it's above the threshold. <strong>Safer than forcing <code>BROADCAST</code> globally.</strong></li>
+<li><strong><code>SET SESSION join_reordering_strategy = 'NONE'</code></strong> — preserves SQL order, so writing <code>FROM variants v INNER JOIN annotations_dedup a</code> survives the optimizer.</li>
+</ol>
+<h3>Athena</h3>
+<p>None of the above session knobs are user-exposed. No comment-style hints (<code>/*+ BROADCAST */</code>) are honored. Available paths:</p>
+<ol>
+<li><strong>Predicate rewriting</strong> — replace forms the CBO cannot estimate well (e.g. <code>&lt;&gt;</code>, wildcard <code>LIKE</code>, function-wrapped columns) with equivalent forms that have clearer selectivity (e.g. explicit <code>IN (...)</code> lists). Aim is to give the optimizer row estimates close enough to reality that it stops choosing <code>REPLICATED</code> with the wrong build side.</li>
+<li><strong>CTAS-then-join</strong> — materialize the small filtered annotations side as a temp Iceberg table first, then join. The temp table has accurate row-count metadata, so the optimizer no longer has to guess.</li>
+</ol>
+<hr>
+<h2>14. Conclusions</h2>
+<ol>
+<li><p><strong>The failure is a planner mistake, not a data-volume problem.</strong> The smallest workload by every cardinality measure is the one that fails — because Athena selects <code>distribution = REPLICATED</code> with the wrong build side (variants), and Athena workers with fixed per-node memory can't absorb the resulting broadcast.</p>
+</li>
+<li><p><strong>The chr1 split survives because Athena chose a different distribution entirely</strong> — <code>PARTITIONED</code> (hash shuffle) instead of <code>REPLICATED</code>. Neither side is broadcast, so per-node memory is bounded by the partitioned slice, not the full filtered table. The chr6 and chr6+pos splits get <code>REPLICATED</code> and fail.</p>
+</li>
+<li><p><strong>Statistics extensions (<code>ANALYZE</code>, Puffin files, <code>SHOW STATS</code>) are blocked on S3 Tables.</strong> The CBO cannot be repaired by feeding it better statistics — only by reshaping the query or forcing the plan.</p>
+</li>
+<li><p><strong><code>SET SESSION join_distribution_type = 'BROADCAST'</code> works on Trino because it disables the cost-based input swap</strong>, not because it changes distribution semantics. Default <code>AUTOMATIC</code> mode considers swapping the left and right inputs as part of the cost comparison — and that's the rule that gets confused on this workload.</p>
+</li>
+<li><p><strong>Trino on a 1 TB EC2 box succeeds where Athena fails</strong> purely because of memory headroom — same wrong plan, but enough RAM to broadcast a 16 GB variants slice. AWS support has confirmed Athena per-node memory is <strong>not customisable</strong>.</p>
+</li>
+<li><p><strong>At this scale, manual customisation and optimisation cannot be fully avoided</strong> — and that comes with at least some level of ongoing maintenance overhead.</p>
+</li>
+</ol>
+<hr>
+
+  </article>
+  <script>
+      window.addEventListener('load', function () {
+          if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+              window.MathJax.typesetPromise().catch(function (err) {
+                  console.warn('MathJax typeset failed:', err);
+              });
+          }
+      });
+  </script>
+</body>
+</html>
